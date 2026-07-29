@@ -56,3 +56,8 @@ vcpkg_installed
 flutter/lib/generated_plugin_registrant.dart
 libsciter.dylib
 flutter/web/
+# build-time branding marker (customize/apply.sh)
+.gecka-customized
+.gecka-incoming-only
+# local deployment config (server + its public key); CI uses repo variables
+customize/branding.env

@@ -1,0 +1,825 @@
+name: Gecka release builds
+
+# Tag-driven release pipeline. Push a tag (e.g. v1.4.7-1) and this builds
+# every platform for both apps and publishes them to a GitHub release
+# attached to that tag.
+#
+#   full  - Gecka Remote Support, the complete client (technician side)
+#   quick - Gecka Quick Support, the incoming-only support client
+#
+# Asset names are deliberately version-less so the "latest" URLs stay stable
+# across tags, e.g.:
+#   https://github.com/Gecka-Apps/Gecka-Remote-Support/releases/latest/download/geckaremotesupport-windows-x86_64.exe
+#   https://github.com/Gecka-Apps/Gecka-Remote-Support/releases/latest/download/geckaquicksupport-linux-x86_64.deb
+#
+# The branding (customize/apply.sh <variant>) is applied at build time,
+# right after checkout, so this file stays a thin layer over upstream.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: write
+
+env:
+  RUST_VERSION: "1.75"
+  MAC_RUST_VERSION: "1.81"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  ANDROID_FLUTTER_VERSION: "3.24.5"
+  CARGO_NDK_VERSION: "3.1.2"
+  NDK_VERSION: "r28c"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  # Deployment target consumed by customize/apply.sh (repository variables).
+  GECKA_RENDEZVOUS_SERVER: ${{ vars.GECKA_RENDEZVOUS_SERVER }}
+  GECKA_RS_PUB_KEY: ${{ vars.GECKA_RS_PUB_KEY }}
+  # Release notes: scam-warning banner (pinned to the tag) + link to the README.
+  RELEASE_BODY: |
+    ![Warning: you may be being scammed](https://raw.githubusercontent.com/Gecka-Apps/Gecka-Remote-Support/${{ github.ref_name }}/customize/branding/release-warning.png)
+
+    Install instructions and platform trust steps: see the [README](https://github.com/Gecka-Apps/Gecka-Remote-Support#readme).
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-temptopmostwindow:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  # ---------------------------------------------------------------- Windows
+  windows:
+    name: windows ${{ matrix.variant.id }}
+    needs: [generate-bridge, build-temptopmostwindow]
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { id: full, slug: geckaremotesupport, app: GeckaRemoteSupport }
+          - { id: quick, slug: geckaquicksupport, app: GeckaQuickSupport }
+    env:
+      VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Apply Gecka branding (+ variant)
+        shell: bash
+        run: |
+          bash customize/apply.sh ${{ matrix.variant.id }}
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@1a3da29f56261a1e1f937ec88f0856a9b8321d7e # v1
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
+          key: ${{ matrix.variant.id }}
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          $VCPKG_ROOT/vcpkg install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"
+        shell: bash
+
+      - name: Build the app
+        run: |
+          python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
+          mv ./flutter/build/windows/x64/runner/Release ./app
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./app
+          # Remote printer driver + adapter (checksummed), bundled into ./app so
+          # the MSI harvests them and the printer CustomAction finds the .inf.
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile printer_driver.zip
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_adapter.zip
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile printer_sha256sums
+          $sum_driver = (Select-String -Path .\printer_sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+          $sum_adapter = (Select-String -Path .\printer_sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
+          if ((Get-FileHash printer_driver.zip -Algorithm SHA256).Hash -ne $sum_driver) { throw "printer driver checksum mismatch" }
+          if ((Get-FileHash printer_adapter.zip -Algorithm SHA256).Hash -ne $sum_adapter) { throw "printer adapter checksum mismatch" }
+          Expand-Archive printer_driver.zip -DestinationPath .
+          mkdir ./app/drivers
+          mv -Force .\rustdesk_printer_driver_v4-1.4 ./app/drivers/RustDeskPrinterDriver
+          Expand-Archive printer_adapter.zip -DestinationPath .
+          mv -Force .\printer_driver_adapter.dll ./app
+
+      - name: find Runner.res
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res")
+          [ -n "$runner_res" ] && cp "$runner_res" ./libs/portable/Runner.res || echo "Runner.res not found"
+
+      - name: Download TempTopMostWindow artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: "./app"
+
+      - name: Build portable exe + msi
+        shell: bash
+        run: |
+          mkdir -p out
+          # Portable self-extracting exe
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../app/ -o . -e ../../app/${{ matrix.variant.app }}.exe
+          popd
+          mv ./target/release/rustdesk-portable-packer.exe "out/${{ matrix.variant.slug }}-windows-x86_64.exe"
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+
+      - name: Build msi
+        shell: bash
+        run: |
+          pushd ./res/msi
+          python preprocess.py --arp -d ../../app
+          nuget restore msi.sln
+          MSBuild.exe msi.sln -p:Configuration=Release -p:Platform=x64 //p:TargetVersion=Windows10
+          popd
+          mv ./res/msi/Package/bin/x64/Release/en-us/Package.msi "out/${{ matrix.variant.slug }}-windows-x86_64.msi"
+
+      - name: Sign exe and msi with the Gecka code-signing cert
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        run: |
+          $pfx = "$env:RUNNER_TEMP\gecka-codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          Get-ChildItem out\*.exe, out\*.msi | ForEach-Object {
+            & $signtool sign /f $pfx /p $env:PFX_PASSWORD /fd sha256 `
+              /tr http://timestamp.digicert.com /td sha256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed on $($_.Name)" }
+          }
+          Remove-Item $pfx
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: false
+          body: ${{ env.RELEASE_BODY }}
+          files: out/*
+
+  # ------------------------------------------------------------------ Linux
+  linux:
+    name: linux ${{ matrix.variant.id }}
+    needs: [generate-bridge]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { id: full, slug: geckaremotesupport, app: GeckaRemoteSupport }
+          - { id: quick, slug: geckaquicksupport, app: GeckaQuickSupport }
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          # The runner image ships libunwind-14-dev, which collides with the
+          # libunwind-dev that libgstreamer1.0-dev pulls in. Resolve it on its
+          # own first, otherwise the bulk install fails with held packages.
+          sudo apt-get install -y libunwind-dev
+          sudo apt-get install -y \
+            g++ gcc git curl nasm yasm libgtk-3-dev clang libxcb-randr0-dev \
+            libxdo-dev libxfixes-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev libpulse-dev cmake make libclang-dev ninja-build \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libpam0g-dev \
+            libva-dev libvdpau-dev libayatana-appindicator3-dev
+
+      - name: Apply Gecka branding (+ variant)
+        run: |
+          bash customize/apply.sh ${{ matrix.variant.id }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: ubuntu-22.04
+          key: ${{ matrix.variant.id }}
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          $VCPKG_ROOT/vcpkg install --triplet x64-linux --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Build the app
+        run: python3 ./build.py --flutter --hwcodec
+
+      - name: Collect deb
+        run: |
+          mkdir -p out
+          deb=$(ls ${{ matrix.variant.slug }}-*.deb | head -n1)
+          mv "$deb" "out/${{ matrix.variant.slug }}-linux-x86_64.deb"
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get install -y rpm libfuse2 libarchive-tools flatpak flatpak-builder
+          sudo pip3 install "setuptools_scm<10"
+          sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
+
+      - name: Package rpm (Fedora + openSUSE)
+        run: |
+          # The branded specs (res/rpm-flutter*.spec) install from the build
+          # tree; move each rpm out immediately to avoid the two specs clashing
+          # on the same output name.
+          HBB="$(pwd)" rpmbuild ./res/rpm-flutter.spec -bb
+          mv ~/rpmbuild/RPMS/x86_64/${{ matrix.variant.slug }}-*.rpm \
+            "out/${{ matrix.variant.slug }}-linux-x86_64.rpm"
+          HBB="$(pwd)" rpmbuild ./res/rpm-flutter-suse.spec -bb
+          mv ~/rpmbuild/RPMS/x86_64/${{ matrix.variant.slug }}-*.rpm \
+            "out/${{ matrix.variant.slug }}-linux-x86_64-suse.rpm"
+
+      - name: Package AppImage
+        run: |
+          # The branded recipe consumes <slug>.deb from the appimage/ dir.
+          cp "out/${{ matrix.variant.slug }}-linux-x86_64.deb" \
+            "appimage/${{ matrix.variant.slug }}.deb"
+          pushd appimage
+          sudo appimage-builder --skip-tests --recipe ./AppImageBuilder-x86_64.yml
+          popd
+          mv appimage/${{ matrix.variant.slug }}-*.AppImage \
+            "out/${{ matrix.variant.slug }}-linux-x86_64.AppImage"
+
+      - name: Package flatpak
+        run: |
+          # The branded manifest consumes <slug>.deb; its app-id drives the bundle.
+          cp "out/${{ matrix.variant.slug }}-linux-x86_64.deb" \
+            "flatpak/${{ matrix.variant.slug }}.deb"
+          flatpak_id="$(python3 -c "import json;print(json.load(open('flatpak/rustdesk.json'))['id'])")"
+          flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          pushd flatpak
+          git clone https://github.com/flathub/shared-modules.git --depth=1
+          flatpak-builder --user --install-deps-from=flathub -y --force-clean --repo=repo ./build ./rustdesk.json
+          flatpak build-bundle ./repo \
+            "../out/${{ matrix.variant.slug }}-linux-x86_64.flatpak" "$flatpak_id"
+          popd
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: false
+          body: ${{ env.RELEASE_BODY }}
+          files: out/*
+
+  # ------------------------------------------------------------------ macOS
+  macos:
+    name: macos ${{ matrix.job.arch }} ${{ matrix.variant.id }}
+    needs: [generate-bridge]
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { id: full, slug: geckaremotesupport, app: GeckaRemoteSupport }
+          - { id: quick, slug: geckaquicksupport, app: GeckaQuickSupport }
+        job:
+          - { arch: x86_64, os: macos-15-intel, target: x86_64-apple-darwin, extra: "" }
+          - { arch: aarch64, os: macos-14, target: aarch64-apple-darwin, extra: "--screencapturekit" }
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Apply Gecka branding (+ variant)
+        run: |
+          bash customize/apply.sh ${{ matrix.variant.id }}
+
+      - name: Install build runtime
+        run: |
+          brew install llvm create-dmg
+          command -v pkg-config >/dev/null || brew install pkg-config
+
+      - name: Install NASM
+        run: |
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Workaround for flutter issue
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ matrix.job.target }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: ${{ matrix.job.os }}
+          key: ${{ matrix.variant.id }}
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          $VCPKG_ROOT/vcpkg install --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Build the app
+        run: |
+          if [ "${{ matrix.job.target }}" = "aarch64-apple-darwin" ]; then
+            MIN_MACOS_VERSION="12.3"
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+            sed -i -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+          fi
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.job.extra }}
+
+      - name: Ad-hoc codesign the app
+        run: |
+          # No paid Developer ID: an ad-hoc signature still lets the app run on
+          # Apple Silicon (avoids "app is damaged"). Gatekeeper only shows the
+          # "unidentified developer" prompt (right-click > Open once).
+          app="./flutter/build/macos/Build/Products/Release/${{ matrix.variant.app }}.app"
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+
+      - name: Create unsigned dmg
+        run: |
+          CREATE_DMG="$(readlink -f "$(command -v create-dmg)")"
+          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
+          mkdir -p out
+          create-dmg --icon "${{ matrix.variant.app }}.app" 200 190 --hide-extension "${{ matrix.variant.app }}.app" \
+            --window-size 800 400 --app-drop-link 600 185 \
+            "out/${{ matrix.variant.slug }}-macos-${{ matrix.job.arch }}.dmg" \
+            ./flutter/build/macos/Build/Products/Release/${{ matrix.variant.app }}.app
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: false
+          body: ${{ env.RELEASE_BODY }}
+          files: out/*
+
+  # ----------------------------------------------------------------- Android
+  # Native lib per (variant, arch); the apk is assembled by the `android` job.
+  android-lib:
+    name: android lib ${{ matrix.variant.id }} ${{ matrix.job.arch }}
+    needs: [generate-bridge]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { id: full, slug: geckaremotesupport, app: GeckaRemoteSupport }
+          - { id: quick, slug: geckaquicksupport, app: GeckaQuickSupport }
+        job:
+          - { arch: aarch64, target: aarch64-linux-android, android: arm64-v8a }
+          - { arch: armv7, target: armv7-linux-androideabi, android: armeabi-v7a }
+          - { arch: x86_64, target: x86_64-linux-android, android: x86_64 }
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+               clang \
+               cmake \
+               curl \
+               gcc-multilib \
+               git \
+               g++ \
+               g++-multilib \
+               libayatana-appindicator3-dev \
+               libasound2-dev \
+               libc6-dev \
+               libclang-dev \
+               libunwind-dev \
+               libgstreamer1.0-dev \
+               libgstreamer-plugins-base1.0-dev \
+               libgtk-3-dev \
+               libpam0g-dev \
+               libpulse-dev \
+               libva-dev \
+               libxcb-randr0-dev \
+               libxcb-shape0-dev \
+               libxcb-xfixes0-dev \
+               libxdo-dev \
+               libxfixes-dev \
+               llvm-dev \
+               nasm \
+               ninja-build \
+               openjdk-17-jdk-headless \
+               pkg-config \
+               tree \
+               wget
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Apply Gecka branding (+ variant)
+        run: |
+          bash customize/apply.sh ${{ matrix.variant.id }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.ANDROID_FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        run: |
+          if ! ./flutter/build_android_deps.sh "${{ matrix.job.android }}"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: rustdesk-lib-cache-android
+          key: ${{ matrix.variant.id }}-${{ matrix.job.target }}
+
+      - name: Build rustdesk lib
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          rustup target add ${{ matrix.job.target }}
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          case ${{ matrix.job.target }} in
+            aarch64-linux-android)
+              ./flutter/ndk_arm64.sh
+            ;;
+            armv7-linux-androideabi)
+              ./flutter/ndk_arm.sh
+            ;;
+            x86_64-linux-android)
+              ./flutter/ndk_x64.sh
+            ;;
+          esac
+
+      - name: Upload Rustdesk library to Artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: librustdesk.so.${{ matrix.variant.id }}.${{ matrix.job.target }}
+          path: ./target/${{ matrix.job.target }}/release/liblibrustdesk.so
+
+  android:
+    name: android ${{ matrix.variant.id }}
+    needs: [android-lib]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { id: full, slug: geckaremotesupport, app: GeckaRemoteSupport }
+          - { id: quick, slug: geckaquicksupport, app: GeckaQuickSupport }
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+               clang \
+               cmake \
+               curl \
+               gcc-multilib \
+               git \
+               g++ \
+               g++-multilib \
+               libayatana-appindicator3-dev \
+               libasound2-dev \
+               libc6-dev \
+               libclang-dev \
+               libunwind-dev \
+               libgstreamer1.0-dev \
+               libgstreamer-plugins-base1.0-dev \
+               libgtk-3-dev \
+               libpam0g-dev \
+               libpulse-dev \
+               libva-dev \
+               libxcb-randr0-dev \
+               libxcb-shape0-dev \
+               libxcb-xfixes0-dev \
+               libxdo-dev \
+               libxfixes-dev \
+               llvm-dev \
+               nasm \
+               ninja-build \
+               openjdk-17-jdk-headless \
+               pkg-config \
+               tree \
+               wget
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Apply Gecka branding (+ variant)
+        run: |
+          bash customize/apply.sh ${{ matrix.variant.id }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.ANDROID_FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Download arm64-v8a lib
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: librustdesk.so.${{ matrix.variant.id }}.aarch64-linux-android
+          path: ./flutter/android/app/src/main/jniLibs/arm64-v8a
+
+      - name: Download armeabi-v7a lib
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: librustdesk.so.${{ matrix.variant.id }}.armv7-linux-androideabi
+          path: ./flutter/android/app/src/main/jniLibs/armeabi-v7a
+
+      - name: Download x86_64 lib
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: librustdesk.so.${{ matrix.variant.id }}.x86_64-linux-android
+          path: ./flutter/android/app/src/main/jniLibs/x86_64
+
+      - name: Build universal + per-abi APKs
+        shell: bash
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
+          # Increase Gradle JVM memory for CI builds
+          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          # temporary use debug sign config; r0adkll signs the release apk afterwards
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          mv ./flutter/android/app/src/main/jniLibs/arm64-v8a/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/
+          mv ./flutter/android/app/src/main/jniLibs/armeabi-v7a/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/libc++_shared.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/
+          mv ./flutter/android/app/src/main/jniLibs/x86_64/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86_64/librustdesk.so
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/x86_64/
+          mkdir -p signed-apk
+          pushd flutter
+          # universal APK (all ABIs in one file, for direct download)
+          flutter build apk --release --target-platform android-arm64,android-arm,android-x64
+          mv build/app/outputs/flutter-apk/app-release.apk "../signed-apk/${{ matrix.variant.slug }}-android-universal.apk"
+          # per-ABI APKs (lighter, preferred by F-Droid)
+          flutter build apk --release --split-per-abi --target-platform android-arm64,android-arm,android-x64
+          mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "../signed-apk/${{ matrix.variant.slug }}-android-arm64-v8a.apk"
+          mv build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk "../signed-apk/${{ matrix.variant.slug }}-android-armeabi-v7a.apk"
+          mv build/app/outputs/flutter-apk/app-x86_64-release.apk "../signed-apk/${{ matrix.variant.slug }}-android-x86_64.apk"
+          popd
+
+      # https://github.com/r0adkll/sign-android-release/issues/84#issuecomment-1889636075
+      - name: Setup sign tool version variable
+        shell: bash
+        run: |
+          BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
+          echo "ANDROID_SIGN_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
+          echo Last build tool version is: $BUILD_TOOL_VERSION
+
+      - uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407 # v1
+        name: Sign app APK
+        id: sign-rustdesk
+        with:
+          releaseDirectory: ./signed-apk
+          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          alias: ${{ secrets.ANDROID_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: false
+          body: ${{ env.RELEASE_BODY }}
+          files: signed-apk/*-signed.apk
